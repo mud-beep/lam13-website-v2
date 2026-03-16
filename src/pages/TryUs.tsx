@@ -293,6 +293,27 @@ const cleanMessage = (text: string): string => {
   return cleaned.trim();
 };
 
+const formatEmbeddedJsonForDisplay = (text: string): string => {
+  if (!text || !text.includes('"request_received"')) return text;
+
+  const deFenced = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+  const start = deFenced.indexOf("{");
+  const end = deFenced.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return text;
+
+  const candidate = deFenced.slice(start, end + 1).trim();
+  try {
+    const parsed = JSON.parse(candidate);
+    const pretty = JSON.stringify(parsed, null, 2);
+    const before = deFenced.slice(0, start).trimEnd();
+    const after = deFenced.slice(end + 1).trimStart();
+    const jsonBlock = `\`\`\`json\n${pretty}\n\`\`\``;
+    return [before, jsonBlock, after].filter(Boolean).join("\n\n").trim();
+  } catch {
+    return text;
+  }
+};
+
 const parseChatTextToMessages = (text: string): Message[] => {
   try {
     const qaPairs = JSON.parse(text); // [{ question, answer }]
@@ -345,7 +366,14 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   timestamp: Date;
+  hasDocument?: boolean;
+  docName?: string;
   payload?: any; // Store generation payload
+  hitl?: {
+    status?: "pending" | "resolved";
+    questions?: HitlQuestion[];
+    answers?: Array<Record<string, any>>;
+  };
 }
 
 interface Chat {
@@ -361,6 +389,7 @@ interface Chat {
 interface ChatStreamResult {
   response: string;
   title?: string;
+  hitlQuestions?: HitlQuestion[];
 }
 
 interface UploadDocumentResult {
@@ -368,6 +397,19 @@ interface UploadDocumentResult {
   messageId: string;
   message: string;
   documentInfo?: Record<string, any>;
+}
+
+interface HitlOption {
+  id: string;
+  label: string;
+}
+
+interface HitlQuestion {
+  id: string;
+  prompt: string;
+  options: HitlOption[];
+  allow_other?: boolean;
+  other_placeholder?: string;
 }
 
 const TryUs = () => {
@@ -393,6 +435,8 @@ const TryUs = () => {
   const [isThinkingExpanded, setIsThinkingExpanded] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [isSearching, setIsSearching] = useState(false);
+  const [hitlSelectedOptions, setHitlSelectedOptions] = useState<Record<string, string>>({});
+  const [hitlOtherText, setHitlOtherText] = useState<Record<string, string>>({});
   const step6IntervalRef = useRef<NodeJS.Timeout | null>(null);
   const isThinkingActiveRef = useRef(false);
 
@@ -409,6 +453,7 @@ const TryUs = () => {
   const renderedRef = useRef("");
   const animationRef = useRef<number>();
   const isStreamingRef = useRef(false);
+  const loadedConversationRef = useRef<string>("");
 
   // Smooth streaming render loop - keeps running while streaming
   const startRenderLoop = () => {
@@ -556,13 +601,35 @@ const TryUs = () => {
   }, [activeChat]);
 
   const currentChat = chats.find((c) => c.id === activeChat);
+  const latestPendingHitlMessage = [...(currentChat?.messages || [])]
+    .reverse()
+    .find(
+      (m) =>
+        m.role === "assistant" &&
+        m.hitl?.status === "pending" &&
+        Array.isArray(m.hitl?.questions) &&
+        (m.hitl?.questions?.length || 0) > 0
+    );
+  const hasDraftHitlAnswers = Boolean(
+    latestPendingHitlMessage &&
+      (latestPendingHitlMessage.hitl?.questions || []).some((q) => {
+        const key = `${latestPendingHitlMessage.id}:${q.id}`;
+        const selected = hitlSelectedOptions[key];
+        const other = (hitlOtherText[key] || "").trim();
+        return Boolean(selected || other);
+      })
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     const loadConversation = async () => {
       if (!threadsLoaded || !activeChat || !accessToken) return;
+      if (loadedConversationRef.current === activeChat) return;
+
       try {
         const res = await fetch(`${BACKEND_API_URL}/chat/${activeChat}`, {
           headers: getAuthHeaders(),
+          signal: controller.signal,
         });
         if (!res.ok) return;
         const data = await res.json();
@@ -572,6 +639,9 @@ const TryUs = () => {
             id: m.id || `${activeChat}-${idx}`,
             role: m.role,
             content: m.content,
+            hasDocument: Boolean(m.has_document),
+            docName: m.doc_name || undefined,
+            hitl: m.hitl || undefined,
             timestamp: new Date(),
           }));
 
@@ -582,12 +652,17 @@ const TryUs = () => {
               : chat
           )
         );
+        loadedConversationRef.current = activeChat;
       } catch (err) {
+        if ((err as Error).name === "AbortError") {
+          return;
+        }
         console.error("Failed to load conversation:", err);
       }
     };
 
     loadConversation();
+    return () => controller.abort();
   }, [threadsLoaded, activeChat, accessToken]);
 
   const scrollToBottom = () => {
@@ -793,9 +868,14 @@ const TryUs = () => {
     }, 5000); // 5 seconds per step
   };
 
-  const uploadDocumentToThread = async (sessionId: string, file: File): Promise<UploadDocumentResult> => {
+  const uploadDocumentToThread = async (
+    sessionId: string,
+    messageId: string,
+    file: File
+  ): Promise<UploadDocumentResult> => {
     const form = new FormData();
     form.append("file", file);
+    form.append("messageId", messageId);
     form.append("message", `Uploaded document: ${file.name}`);
 
     const response = await fetch(`${BACKEND_API_URL}/chat/${sessionId}/messages/upload`, {
@@ -816,7 +896,9 @@ const TryUs = () => {
     sessionId: string,
     message: string,
     messageId?: string,
-    uploadedMessageId?: string
+    uploadedMessageId?: string,
+    hitlAnswers?: Array<Record<string, any>>,
+    isHitlOnly?: boolean
   ) => {
     const form = new FormData();
     form.append("message", message);
@@ -825,6 +907,12 @@ const TryUs = () => {
     }
     if (uploadedMessageId) {
       form.append("uploadedMessageId", uploadedMessageId);
+    }
+    if (hitlAnswers && hitlAnswers.length > 0) {
+      form.append("hitlAnswers", JSON.stringify(hitlAnswers));
+    }
+    if (isHitlOnly) {
+      form.append("isHitlOnly", "true");
     }
     form.append("sessionId", sessionId);
 
@@ -846,7 +934,9 @@ const TryUs = () => {
     sessionId: string,
     message: string,
     messageId?: string,
-    uploadedMessageId?: string
+    uploadedMessageId?: string,
+    hitlAnswers?: Array<Record<string, any>>,
+    isHitlOnly?: boolean
   ): Promise<ChatStreamResult> => {
     return new Promise((resolve, reject) => {
       const token = getAccessToken();
@@ -882,7 +972,7 @@ const TryUs = () => {
           const data = JSON.parse(event.data);
           if (data.type === "auth" && !sentMessage) {
             sentMessage = true;
-            ws.send(JSON.stringify({ message, messageId, uploadedMessageId }));
+            ws.send(JSON.stringify({ message, messageId, uploadedMessageId, hitlAnswers, isHitlOnly: Boolean(isHitlOnly) }));
             return;
           }
           if (data.type === "start") {
@@ -900,9 +990,14 @@ const TryUs = () => {
             return;
           }
           if (data.type === "end") {
-            const cleaned = fixMarkdown(addMissingSpaces(cleanMessage(incomingRef.current)));
+            const finalRaw = incomingRef.current || data?.metadata?.chatbotResponse || "";
+            const cleaned = fixMarkdown(addMissingSpaces(cleanMessage(finalRaw)));
             ws.close();
-            finish({ response: cleaned, title: data?.metadata?.title });
+            finish({
+              response: cleaned,
+              title: data?.metadata?.title,
+              hitlQuestions: Array.isArray(data?.metadata?.hitlQuestions) ? data.metadata.hitlQuestions : [],
+            });
             return;
           }
           if (data.type === "error") {
@@ -935,30 +1030,13 @@ const TryUs = () => {
       return;
     }
 
+    const pendingMessageId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setSelectedFile(file);
+    setUploadedMessageId(pendingMessageId);
     setIsUploadingFile(true);
     try {
-      const uploaded = await uploadDocumentToThread(activeChat, file);
-      setUploadedMessageId(uploaded.messageId);
-
-      setChats((prev) =>
-        prev.map((chat) =>
-          chat.id === activeChat
-            ? {
-                ...chat,
-                messages: [
-                  ...chat.messages,
-                  {
-                    id: uploaded.messageId,
-                    role: "user",
-                    content: uploaded.message,
-                    timestamp: new Date(),
-                  },
-                ],
-              }
-            : chat
-        )
-      );
+      const uploaded = await uploadDocumentToThread(activeChat, pendingMessageId, file);
+      setUploadedMessageId(uploaded.messageId || pendingMessageId);
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Upload failed";
       alert(msg);
@@ -975,18 +1053,71 @@ const TryUs = () => {
     setUploadedMessageId("");
   };
 
+  const buildHitlKey = (messageId: string, questionId: string) => `${messageId}:${questionId}`;
+
+  const collectHitlAnswersForMessage = (message: Message | undefined) => {
+    if (!message || message.role !== "assistant") return [] as Array<Record<string, any>>;
+    const questions = message.hitl?.questions || [];
+    return questions
+      .map((q) => {
+        const key = buildHitlKey(message.id, q.id);
+        const selectedOptionId = hitlSelectedOptions[key];
+        const selectedOption = q.options.find((o) => o.id === selectedOptionId);
+        const otherText = (hitlOtherText[key] || "").trim();
+        if (!selectedOptionId && !otherText) {
+          return null;
+        }
+        return {
+          questionId: q.id,
+          question: q.prompt,
+          selectedOptionId: selectedOptionId || null,
+          selectedOptionLabel: selectedOption?.label || null,
+          otherText: otherText || null,
+        };
+      })
+      .filter(Boolean) as Array<Record<string, any>>;
+  };
+
   const handleSend = async () => {
-    if ((!input.trim() && !uploadedMessageId) || isTyping || isUploadingFile) return;
+    const currentMessages = currentChat?.messages || [];
+    const pendingHitlMessage = [...currentMessages]
+      .reverse()
+      .find(
+        (m) =>
+          m.role === "assistant" &&
+          m.hitl?.status === "pending" &&
+          Array.isArray(m.hitl?.questions) &&
+          (m.hitl?.questions?.length || 0) > 0
+      );
+    const compiledHitlAnswers = collectHitlAnswersForMessage(pendingHitlMessage);
+    const hasHitlAnswers = compiledHitlAnswers.length > 0;
+    const hasInputPayload = Boolean(input.trim() || uploadedMessageId);
+
+    if ((!hasInputPayload && !hasHitlAnswers) || isTyping || isUploadingFile) return;
     if (!accessToken) {
       alert("Please sign in first.");
       return;
     }
 
     const text = input.trim() || (selectedFile ? `Analyze uploaded document: ${selectedFile.name}` : "");
+    const isHitlOnly = !text && hasHitlAnswers;
+    const finalUserMessageId = uploadedMessageId || `${Date.now().toString()}-user`;
+    const hitlSummaryText = compiledHitlAnswers
+      .map((item) => {
+        const q = String(item.question || "").trim();
+        const ans = String(item.selectedOptionLabel || item.otherText || "").trim();
+        return q && ans ? `Q: ${q}\nA: ${ans}` : "";
+      })
+      .filter(Boolean)
+      .join("\n\n");
+
+    const userContent = isHitlOnly ? hitlSummaryText : text;
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: finalUserMessageId,
       role: "user",
-      content: text,
+      content: userContent,
+      hasDocument: Boolean(uploadedMessageId || selectedFile),
+      docName: selectedFile?.name,
       timestamp: new Date(),
     };
 
@@ -997,13 +1128,14 @@ const TryUs = () => {
               ...chat,
               messages: [...chat.messages, userMessage],
               title:
-                chat.messages.length === 0 && chat.title === "New conversation"
-                  ? text.slice(0, 30) + "..."
+                chat.messages.length === 0 && chat.title === "New conversation" && userContent
+                  ? userContent.slice(0, 30) + "..."
                   : chat.title,
             }
           : chat
       )
     );
+
     setInput("");
     setIsTyping(true);
     setThinkingText("");
@@ -1033,14 +1165,76 @@ const TryUs = () => {
       let responseText = "";
       let generatedTitle: string | undefined;
       try {
-        const wsResult = await streamChatOverWebSocket(activeChat, text, userMessage.id, uploadedMessageId || undefined);
+        const wsResult = await streamChatOverWebSocket(
+          activeChat,
+          text,
+          finalUserMessageId,
+          uploadedMessageId || undefined,
+          compiledHitlAnswers,
+          isHitlOnly
+        );
         responseText = wsResult.response || "No response";
         generatedTitle = wsResult.title;
+        const pendingQuestions = wsResult.hitlQuestions || [];
+        setChats((prev) =>
+          prev.map((chat) => {
+            if (chat.id !== activeChat) return chat;
+            return {
+              ...chat,
+              messages: chat.messages.map((m) => {
+                if (m.id === aiMessageId) {
+                  return {
+                    ...m,
+                    hitl:
+                      pendingQuestions.length > 0
+                        ? { status: "pending", questions: pendingQuestions }
+                        : m.hitl,
+                  };
+                }
+                if (pendingHitlMessage && m.id === pendingHitlMessage.id && hasHitlAnswers) {
+                  return { ...m, hitl: { ...(m.hitl || {}), status: "resolved" } };
+                }
+                return m;
+              }),
+            };
+          })
+        );
       } catch (wsError) {
         console.warn("WS streaming failed, fallback to HTTP:", wsError);
-        const httpResult = await sendToBackend(activeChat, text, userMessage.id, uploadedMessageId || undefined);
+        const httpResult = await sendToBackend(
+          activeChat,
+          text,
+          finalUserMessageId,
+          uploadedMessageId || undefined,
+          compiledHitlAnswers,
+          isHitlOnly
+        );
         responseText = httpResult.response || "No response";
         generatedTitle = httpResult.title;
+        const pendingQuestions = Array.isArray(httpResult.hitlQuestions) ? httpResult.hitlQuestions : [];
+        setChats((prev) =>
+          prev.map((chat) => {
+            if (chat.id !== activeChat) return chat;
+            return {
+              ...chat,
+              messages: chat.messages.map((m) => {
+                if (m.id === aiMessageId) {
+                  return {
+                    ...m,
+                    hitl:
+                      pendingQuestions.length > 0
+                        ? { status: "pending", questions: pendingQuestions }
+                        : m.hitl,
+                  };
+                }
+                if (pendingHitlMessage && m.id === pendingHitlMessage.id && hasHitlAnswers) {
+                  return { ...m, hitl: { ...(m.hitl || {}), status: "resolved" } };
+                }
+                return m;
+              }),
+            };
+          })
+        );
         incomingRef.current = responseText;
       }
 
@@ -1061,6 +1255,19 @@ const TryUs = () => {
       );
       setSelectedFile(null);
       setUploadedMessageId("");
+      if (pendingHitlMessage && hasHitlAnswers) {
+        const keysToClear = (pendingHitlMessage.hitl?.questions || []).map((q) => buildHitlKey(pendingHitlMessage.id, q.id));
+        setHitlSelectedOptions((prev) => {
+          const next = { ...prev };
+          keysToClear.forEach((key) => delete next[key]);
+          return next;
+        });
+        setHitlOtherText((prev) => {
+          const next = { ...prev };
+          keysToClear.forEach((key) => delete next[key]);
+          return next;
+        });
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Chat failed";
       stopRenderLoop();
@@ -1136,13 +1343,22 @@ const TryUs = () => {
     });
   };
 
+  const canRegenerateMessage = (chat: Chat | undefined, message: Message, index: number) => {
+    if (!chat || !accessToken || isTyping) return false;
+    if (message.role !== "assistant") return false;
+    if (index !== chat.messages.length - 1) return false;
+    if (message.hitl?.status === "pending") return false;
+    const previous = chat.messages[index - 1];
+    return Boolean(previous && previous.role === "user" && previous.content?.trim());
+  };
+
   const handleRegenerate = async (message: Message) => {
     if (!activeChat || !currentChat || !accessToken) return;
 
     const messageIndex = currentChat.messages.findIndex((m) => m.id === message.id);
-    if (messageIndex < 1) return;
+    if (!canRegenerateMessage(currentChat, message, messageIndex)) return;
     const previousUser = currentChat.messages[messageIndex - 1];
-    if (!previousUser || previousUser.role !== "user") return;
+    if (!previousUser) return;
 
     setIsTyping(true);
     setThinkingText("");
@@ -1431,6 +1647,14 @@ const TryUs = () => {
               {currentChat?.messages.map((message, index) => {
                 const isLastAssistantMessage = message.role === "assistant" &&
                   index === currentChat.messages.length - 1;
+                const canRegenerate = canRegenerateMessage(currentChat, message, index);
+                const isVisiblePendingCard =
+                  message.role === "assistant" &&
+                  message.hitl?.status === "pending" &&
+                  message.id === latestPendingHitlMessage?.id;
+                const renderedAssistantText = formatEmbeddedJsonForDisplay(
+                  cleanMessage(streamingMessageId === message.id ? streamText : message.content)
+                );
 
                 return (
                 <div
@@ -1455,13 +1679,23 @@ const TryUs = () => {
                               p: ({children}) => <p className="mb-4">{children}</p>
                             }}
                           >
-                            {streamingMessageId === message.id ? cleanMessage(streamText) : cleanMessage(message.content)}
+                            {renderedAssistantText}
                           </ReactMarkdown>
                         </div>
                       ) : (
-                        <p className="text-xs md:text-sm leading-relaxed whitespace-pre-wrap">
-                          {message.content}
-                        </p>
+                        <>
+                          <p className="text-xs md:text-sm leading-relaxed whitespace-pre-wrap">
+                            {message.content}
+                          </p>
+                          {message.hasDocument && (
+                            <div className="mt-2 inline-flex items-center gap-1 rounded-md border border-border/60 bg-background/50 px-2 py-1">
+                              <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+                              <span className="text-[11px] text-muted-foreground">
+                                {message.docName || "Document attached"}
+                              </span>
+                            </div>
+                          )}
+                        </>
                       )}
                       {message.role === "assistant" && loggedInUser && message.id === currentChat?.messages[currentChat.messages.length - 1]?.id && currentChat?.is_ready && currentChat?.report_link && (
                         <div className="mt-3 p-3 bg-green-50 dark:bg-green-900/20 rounded-lg border border-green-200 dark:border-green-800">
@@ -1478,6 +1712,47 @@ const TryUs = () => {
                         </div>
                       )}
                     </div>
+                    {isVisiblePendingCard && (message.hitl?.questions?.length || 0) > 0 && (
+                      <div className="mt-3 rounded-xl border border-border/60 bg-secondary/30 p-3 space-y-3 max-w-[85%] md:max-w-[70%]">
+                        <p className="text-sm font-medium">Quick clarifications</p>
+                        {(message.hitl?.questions || []).map((q) => {
+                          const key = buildHitlKey(message.id, q.id);
+                          return (
+                            <div key={q.id} className="space-y-2">
+                              <p className="text-xs md:text-sm text-foreground">{q.prompt}</p>
+                              <div className="flex flex-wrap gap-2">
+                                {q.options.map((option) => (
+                                  <button
+                                    key={option.id}
+                                    type="button"
+                                    className={`px-2 py-1 rounded-md text-xs border ${
+                                      hitlSelectedOptions[key] === option.id
+                                        ? "bg-accent text-accent-foreground border-accent"
+                                        : "bg-background border-border/60"
+                                    }`}
+                                    onClick={() =>
+                                      setHitlSelectedOptions((prev) => ({ ...prev, [key]: option.id }))
+                                    }
+                                  >
+                                    {option.label}
+                                  </button>
+                                ))}
+                              </div>
+                              {q.allow_other && (
+                                <input
+                                  value={hitlOtherText[key] || ""}
+                                  onChange={(e) =>
+                                    setHitlOtherText((prev) => ({ ...prev, [key]: e.target.value }))
+                                  }
+                                  placeholder={q.other_placeholder || "Please specify"}
+                                  className="w-full rounded-md border border-border/60 bg-background px-2 py-1 text-xs md:text-sm"
+                                />
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                     {message.role === "assistant" && (() => {
                       const isErrorMessage = message.content.toLowerCase().includes("our servers are currently overloaded") || 
                                              message.content.toLowerCase().includes("our servers are overloaded") || 
@@ -1523,7 +1798,7 @@ const TryUs = () => {
                         >
                           <ThumbsDown className="h-3.5 w-3.5" />
                         </Button>
-                        {isLastAssistantMessage && (
+                        {canRegenerate && (
                           <Button
                             variant="ghost"
                             size="sm"
@@ -1688,7 +1963,7 @@ const TryUs = () => {
               </div>
               <Button
                 onClick={handleSend}
-                disabled={(!input.trim() && !uploadedMessageId) || isTyping || isUploadingFile}
+                disabled={(!input.trim() && !uploadedMessageId && !hasDraftHitlAnswers) || isTyping || isUploadingFile}
                 className="bg-accent hover:bg-accent/90 text-accent-foreground h-full w-[52px] md:w-[56px] rounded-xl flex-shrink-0"
               >
                 <Send className="w-4 h-4 md:w-5 md:h-5" />
