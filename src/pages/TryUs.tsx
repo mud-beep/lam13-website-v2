@@ -1521,7 +1521,7 @@ const TryUs = () => {
               </p>
             </div>
           ) : (
-            <div className="max-w-4xl mx-auto p-3 md:p-6 space-y-4 md:space-y-6">
+            <div className="max-w-7xl mx-auto p-3 md:p-6 space-y-4 md:space-y-6">
               {currentChat?.messages.map((message, index) => {
                 const isLastAssistantMessage = message.role === "assistant" &&
                   index === currentChat.messages.length - 1;
@@ -1541,8 +1541,8 @@ const TryUs = () => {
                     <div
                       className={`rounded-2xl px-3 md:px-4 py-2 md:py-3 ${
                         message.role === "user"
-                          ? "bg-secondary/80 text-foreground ml-auto max-w-[85%] md:max-w-[70%]"
-                          : "text-foreground max-w-[85%] md:max-w-[70%]"
+                          ? "bg-secondary/80 text-foreground ml-auto max-w-[90%] md:max-w-[85%]"
+                          : "text-foreground max-w-[90%] md:max-w-[85%]"
                       }`}
                     >
                       {message.role === "assistant" ? (
@@ -1734,7 +1734,7 @@ const TryUs = () => {
 
         {/* Input Area */}
         <div className="border-t border-border/50 p-3 md:p-4 bg-background/80 backdrop-blur-sm flex-shrink-0 sticky bottom-0">
-          <div className="max-w-4xl mx-auto">
+          <div className="max-w-7xl mx-auto">
             {selectedFile && (
               <div className="mb-2 rounded-xl border border-border/60 bg-secondary/40 px-3 py-2">
                 <div className="flex items-center justify-between gap-2">
